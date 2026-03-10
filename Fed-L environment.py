@@ -53,9 +53,9 @@ def set_seed(seed: int = 42) -> None:
 
 @dataclass
 class FederatedConfig:
-    num_clients: int = 5
-    num_rounds: int = 20
-    local_epochs: int = 2
+    num_clients: int = 10
+    num_rounds: int = 100
+    local_epochs: int = 5
     batch_size: int = 2
     lr: float = 1e-4
     weight_decay: float = 1e-5
@@ -63,7 +63,7 @@ class FederatedConfig:
     sample_fraction: float = 1.0  # fraction of clients sampled per round
     fedprox_mu: float = 0.0       # 0.0 = FedAvg, >0 = FedProx
     grad_clip: float = 1.0
-    min_clients_per_round: int = 2
+    min_clients_per_round: int = 4
     save_dir: str = "./federated_checkpoints"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -525,3 +525,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
