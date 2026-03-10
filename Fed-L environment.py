@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Mar  9 13:07:55 2026
-
-@author: WIN11
+Federated AGA-Net aligned to Table 3-3 detailed federated learning parameters
 """
 
 import copy
@@ -15,12 +13,9 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, Subset
 
-# Reuse the manuscript implementation as the backbone.
-# Make sure aganet_implementation.py is in the same directory.
 from aganet_implementation import (
     AGANet,
     CombinedLoss,
@@ -49,21 +44,41 @@ def set_seed(seed: int = 42) -> None:
 
 # ============================================================
 # FEDERATED CONFIGURATION
+# Table 3-3 alignment
 # ============================================================
 
 @dataclass
 class FederatedConfig:
-    num_clients: int = 10
-    num_rounds: int = 100
-    local_epochs: int = 5
+    # Core FL parameters
+    num_clients: int = 10                  # K: 8-10 -> use 10
+    num_rounds: int = 100                  # R: 100
+    local_epochs: int = 5                  # E: 5
+    sample_fraction: float = 0.5           # C: 0.5
+    min_clients_per_round: int = 4         # K_min: 4
+
+    # Learning rates
+    global_lr: float = 1e-4                # eta_global: 1e-4
+    local_lr: float = 5e-3                 # eta_local: 5e-3
+    momentum: float = 0.9                  # mu_sgd: 0.9
+    weight_decay: float = 1e-5             # lambda_wd: 1e-5
+
+    # Privacy-related parameters
+    privacy_epsilon: float = 8.0           # epsilon: 8.0
+    privacy_delta: float = 1e-5            # delta: 1e-5
+    dp_noise_multiplier: float = 0.19      # sigma_dp: 0.19
+    grad_clip: float = 2.0                 # C_clip: 2.0
+
+    # Federated regularization / comms
+    fed_reg_weight: float = 0.1            # mu_fed: 0.1
+    compression_rho: float = 0.1           # rho: 0.1
+
+    # Reliability / convergence
+    client_dropout_rate: float = 0.1       # p_dropout: 0.1
+    convergence_tolerance: float = 1e-6    # tau: 1e-6
+
+    # Runtime
     batch_size: int = 2
-    lr: float = 1e-4
-    weight_decay: float = 1e-5
     num_workers: int = 0
-    sample_fraction: float = 1.0  # fraction of clients sampled per round
-    fedprox_mu: float = 0.0       # 0.0 = FedAvg, >0 = FedProx
-    grad_clip: float = 1.0
-    min_clients_per_round: int = 4
     save_dir: str = "./federated_checkpoints"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -79,12 +94,6 @@ def split_indices_among_clients(
     non_iid: bool = False,
     labels: Optional[List[int]] = None,
 ) -> Dict[int, List[int]]:
-    """
-    Split dataset indices across clients.
-
-    IID mode: uniform random split.
-    Non-IID mode: sort by labels and shard contiguous chunks.
-    """
     rng = np.random.default_rng(seed)
     indices = np.arange(dataset_len)
 
@@ -113,17 +122,74 @@ def set_model_state(model: nn.Module, state_dict: OrderedDict, device: str) -> N
     model.to(device)
 
 
-def fedavg_aggregate(
-    client_states: List[OrderedDict],
+def state_to_update(local_state: OrderedDict, global_state: OrderedDict) -> OrderedDict:
+    update = OrderedDict()
+    for k in global_state.keys():
+        update[k] = local_state[k].float() - global_state[k].float()
+    return update
+
+
+def update_to_state(global_state: OrderedDict, update: OrderedDict) -> OrderedDict:
+    new_state = OrderedDict()
+    for k in global_state.keys():
+        new_state[k] = global_state[k].float() + update[k].float()
+    return new_state
+
+
+def compress_update(update: OrderedDict, rho: float) -> OrderedDict:
+    """
+    Simple top-k magnitude sparsification.
+    rho=0.1 means 10% compression ratio dropped? Here we keep (1-rho) of elements.
+    """
+    if rho <= 0.0:
+        return update
+
+    compressed = OrderedDict()
+    keep_ratio = max(0.0, min(1.0, 1.0 - rho))
+
+    for k, v in update.items():
+        flat = v.view(-1)
+        numel = flat.numel()
+        keep_k = max(1, int(numel * keep_ratio))
+
+        if keep_k >= numel:
+            compressed[k] = v
+            continue
+
+        _, idx = torch.topk(flat.abs(), keep_k)
+        mask = torch.zeros_like(flat)
+        mask[idx] = 1.0
+        compressed[k] = (flat * mask).view_as(v)
+
+    return compressed
+
+
+def add_dp_noise(update: OrderedDict, noise_multiplier: float, clip_bound: float) -> OrderedDict:
+    """
+    Basic Gaussian noise addition to clipped updates.
+    Note: this is not a full formal DP accountant.
+    """
+    if noise_multiplier <= 0:
+        return update
+
+    noised = OrderedDict()
+    for k, v in update.items():
+        noise = torch.randn_like(v) * (noise_multiplier * clip_bound)
+        noised[k] = v + noise
+    return noised
+
+
+def fedavg_aggregate_updates(
+    client_updates: List[OrderedDict],
     client_weights: List[int],
 ) -> OrderedDict:
     total_weight = float(sum(client_weights))
     aggregated = OrderedDict()
 
-    for key in client_states[0].keys():
+    for key in client_updates[0].keys():
         weighted_sum = None
-        for state, weight in zip(client_states, client_weights):
-            tensor = state[key].float() * (weight / total_weight)
+        for upd, weight in zip(client_updates, client_weights):
+            tensor = upd[key].float() * (weight / total_weight)
             weighted_sum = tensor if weighted_sum is None else weighted_sum + tensor
         aggregated[key] = weighted_sum
 
@@ -165,21 +231,24 @@ class FederatedClient:
         self.criterion = CombinedLoss()
 
     def _proximal_term(self, global_model: nn.Module) -> torch.Tensor:
-        if self.config.fedprox_mu <= 0:
+        if self.config.fed_reg_weight <= 0:
             return torch.tensor(0.0, device=self.device)
+
         prox = torch.tensor(0.0, device=self.device)
         for local_param, global_param in zip(self.model.parameters(), global_model.parameters()):
             prox += torch.norm(local_param - global_param.detach().to(self.device)) ** 2
-        return 0.5 * self.config.fedprox_mu * prox
+        return 0.5 * self.config.fed_reg_weight * prox
 
     def train_local(self, global_state: OrderedDict) -> Tuple[OrderedDict, Dict[str, float], int]:
         set_model_state(self.model, global_state, self.device)
         global_reference = copy.deepcopy(self.model).to(self.device)
         global_reference.eval()
 
-        optimizer = optim.AdamW(
+        # Table says local learning rate = 5e-3 and momentum = 0.9
+        optimizer = optim.SGD(
             self.model.parameters(),
-            lr=self.config.lr,
+            lr=self.config.local_lr,
+            momentum=self.config.momentum,
             weight_decay=self.config.weight_decay,
         )
 
@@ -206,7 +275,11 @@ class FederatedClient:
 
                 loss = loss + self._proximal_term(global_reference)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip)
+
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.config.grad_clip
+                )
                 optimizer.step()
 
                 total_loss += loss.item()
@@ -228,7 +301,20 @@ class FederatedClient:
             "train_unc_loss": float(np.mean(history["unc_loss"])) if history["unc_loss"] else 0.0,
         })
 
-        return get_model_state(self.model), metrics, len(self.train_loader.dataset)
+        local_state = get_model_state(self.model)
+        local_update = state_to_update(local_state, global_state)
+
+        # Communication compression
+        local_update = compress_update(local_update, self.config.compression_rho)
+
+        # Basic DP-style noise injection on update
+        local_update = add_dp_noise(
+            local_update,
+            noise_multiplier=self.config.dp_noise_multiplier,
+            clip_bound=self.config.grad_clip,
+        )
+
+        return local_update, metrics, len(self.train_loader.dataset)
 
     @torch.no_grad()
     def evaluate_local(self) -> Dict[str, float]:
@@ -248,7 +334,9 @@ class FederatedClient:
                 training=False,
             )
             loss, _, _, _ = self.criterion(seg_pred, masks, cls_pred, labels, uncertainty)
-            metrics_calc.update(seg_pred.cpu(), masks.cpu(), cls_pred.cpu(), labels.cpu(), uncertainty.cpu())
+            metrics_calc.update(
+                seg_pred.cpu(), masks.cpu(), cls_pred.cpu(), labels.cpu(), uncertainty.cpu()
+            )
             total_loss += loss.item()
             num_batches += 1
 
@@ -275,31 +363,46 @@ class FederatedServer:
         os.makedirs(config.save_dir, exist_ok=True)
 
     def sample_clients(self, clients: List[FederatedClient], round_idx: int) -> List[FederatedClient]:
-        num_total = len(clients)
+        # Simulate client dropout first
+        rng = random.Random(42 + round_idx)
+        active_clients = [
+            c for c in clients
+            if rng.random() > self.config.client_dropout_rate
+        ]
+
+        if len(active_clients) < self.config.min_clients_per_round:
+            active_clients = clients[:]
+
+        num_total = len(active_clients)
         num_sampled = max(
             self.config.min_clients_per_round,
-            int(round(self.config.sample_fraction * num_total)),
+            int(round(self.config.sample_fraction * len(clients))),
         )
-        rng = random.Random(42 + round_idx)
-        sampled_indices = rng.sample(range(num_total), min(num_sampled, num_total))
-        return [clients[i] for i in sampled_indices]
+        num_sampled = min(num_sampled, num_total)
 
-    def aggregate_round(
-        self,
-        sampled_clients: List[FederatedClient],
-    ) -> Dict[str, float]:
+        sampled_indices = rng.sample(range(num_total), num_sampled)
+        return [active_clients[i] for i in sampled_indices]
+
+    def aggregate_round(self, sampled_clients: List[FederatedClient]) -> Dict[str, float]:
         global_state = get_model_state(self.global_model)
-        client_states = []
+        client_updates = []
         client_weights = []
         round_metrics = []
 
         for client in sampled_clients:
-            local_state, local_metrics, sample_count = client.train_local(global_state)
-            client_states.append(local_state)
+            local_update, local_metrics, sample_count = client.train_local(global_state)
+            client_updates.append(local_update)
             client_weights.append(sample_count)
             round_metrics.append(local_metrics)
 
-        new_global_state = fedavg_aggregate(client_states, client_weights)
+        aggregated_update = fedavg_aggregate_updates(client_updates, client_weights)
+
+        # Apply server/global learning rate
+        scaled_update = OrderedDict()
+        for k, v in aggregated_update.items():
+            scaled_update[k] = self.config.global_lr * v
+
+        new_global_state = update_to_state(global_state, scaled_update)
         set_model_state(self.global_model, new_global_state, self.config.device)
 
         aggregated_metrics = self._aggregate_metrics(round_metrics, client_weights)
@@ -327,6 +430,7 @@ class FederatedServer:
 
     def fit(self, clients: List[FederatedClient]) -> Dict[str, List[float]]:
         best_auc = -float("inf")
+        prev_val_loss = None
 
         for round_idx in range(1, self.config.num_rounds + 1):
             sampled_clients = self.sample_clients(clients, round_idx)
@@ -344,6 +448,7 @@ class FederatedServer:
             )
 
             self.save_checkpoint(round_idx, metrics)
+
             if metrics.get("val_auc", -float("inf")) > best_auc:
                 best_auc = metrics["val_auc"]
                 best_path = os.path.join(self.config.save_dir, "best_global_model.pth")
@@ -357,6 +462,17 @@ class FederatedServer:
                     },
                     best_path,
                 )
+
+            # Convergence tolerance tau = 1e-6
+            current_val_loss = metrics.get("val_loss", None)
+            if prev_val_loss is not None and current_val_loss is not None:
+                if abs(prev_val_loss - current_val_loss) < self.config.convergence_tolerance:
+                    print(
+                        f"Early stopping at round {round_idx} "
+                        f"(convergence tolerance reached: {self.config.convergence_tolerance})"
+                    )
+                    break
+            prev_val_loss = current_val_loss
 
         return dict(self.history)
 
@@ -477,14 +593,26 @@ def build_federated_clients(
 def main() -> None:
     set_seed(42)
 
+    # Use table-aligned values directly
     config = FederatedConfig(
-        num_clients=5,
-        num_rounds=10,
-        local_epochs=1,
+        num_clients=10,
+        num_rounds=100,
+        local_epochs=5,
         batch_size=2,
-        lr=1e-4,
-        sample_fraction=0.6,
-        fedprox_mu=1e-3,  # set to 0.0 for pure FedAvg
+        global_lr=1e-4,
+        local_lr=5e-3,
+        momentum=0.9,
+        weight_decay=1e-5,
+        sample_fraction=0.5,
+        min_clients_per_round=4,
+        privacy_epsilon=8.0,
+        privacy_delta=1e-5,
+        dp_noise_multiplier=0.19,
+        grad_clip=2.0,
+        fed_reg_weight=0.1,
+        compression_rho=0.1,
+        client_dropout_rate=0.1,
+        convergence_tolerance=1e-6,
         save_dir="./federated_checkpoints",
     )
 
@@ -525,4 +653,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
